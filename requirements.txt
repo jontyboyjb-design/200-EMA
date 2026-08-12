@@ -1,0 +1,8 @@
+streamlit>=1.35
+ccxt>=4.3
+yfinance>=0.2.40
+pandas>=2.0
+
+# Optional: enables the "Auto-scan every 3 minutes" toggle in the sidebar.
+# The app runs fine without it — you'll just click "Scan Now" manually.
+streamlit-autorefresh>=1.0.1
