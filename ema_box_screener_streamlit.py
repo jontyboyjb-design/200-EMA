@@ -9,6 +9,7 @@ Movers : Spot movers per exchange + US Stock movers
 """
 
 import time
+import textwrap
 import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -464,7 +465,7 @@ def get_us_stock_mover_rows(limit=20):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def inject_theme():
-    st.markdown("""
+    st.markdown(textwrap.dedent("""
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -573,7 +574,7 @@ def inject_theme():
 
       .cf-progress-label{ font-size:12px; color: var(--muted); margin-bottom:6px; }
     </style>
-    """, unsafe_allow_html=True)
+    """), unsafe_allow_html=True)
 
 
 # ── HTML render helpers ─────────────────────────────────────────────────────
