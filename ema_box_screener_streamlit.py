@@ -501,9 +501,23 @@ with st.sidebar:
     st.caption("Price must be inside EMA ± % band to match")
 
     st.subheader("EMA Box Range")
-    up_pct = st.number_input("Upper Band % (above EMA)", min_value=0.01, max_value=50.0, value=2.0, step=0.1)
-    dn_pct = st.number_input("Lower Band % (below EMA)", min_value=0.01, max_value=50.0, value=2.0, step=0.1)
-    st.caption(f"+{up_pct:.1f}%  ←  EMA {int(ema_period)}  →  -{dn_pct:.1f}%")
+    use_upper = st.checkbox("Upper Band (above EMA)", value=True)
+    up_pct = st.number_input(
+        "Upper Band %", min_value=0.01, max_value=50.0, value=2.0, step=0.1,
+        disabled=not use_upper, label_visibility="collapsed",
+    )
+    use_lower = st.checkbox("Lower Band (below EMA)", value=True)
+    dn_pct = st.number_input(
+        "Lower Band %", min_value=0.01, max_value=50.0, value=2.0, step=0.1,
+        disabled=not use_lower, label_visibility="collapsed",
+    )
+
+    # A disabled band is set to 0%, so price can't sit on that side of the EMA.
+    eff_up_pct = float(up_pct) if use_upper else 0.0
+    eff_dn_pct = float(dn_pct) if use_lower else 0.0
+    up_txt = f"+{eff_up_pct:.1f}%" if use_upper else "off"
+    dn_txt = f"-{eff_dn_pct:.1f}%" if use_lower else "off"
+    st.caption(f"{up_txt}  ←  EMA {int(ema_period)}  →  {dn_txt}")
 
     auto_scan = st.checkbox("Auto-scan every 3 minutes", value=False, disabled=not HAS_AUTOREFRESH)
     if not HAS_AUTOREFRESH:
@@ -530,6 +544,8 @@ should_scan = scan_clicked or due_for_autoscan
 if should_scan:
     if not selected_markets:
         st.warning("Select at least one market before scanning.")
+    elif not use_upper and not use_lower:
+        st.warning("Tick at least one band (upper or lower) before scanning.")
     else:
         jobs = []
         with st.spinner("Building ticker universe..."):
@@ -546,7 +562,7 @@ if should_scan:
             progress_label.text(f"Scanning... {done}/{total} ({pct}%)")
             progress_bar.progress(pct)
 
-        results = run_ema_box_scan(jobs, int(ema_period), float(up_pct), float(dn_pct), progress_cb=update_progress)
+        results = run_ema_box_scan(jobs, int(ema_period), eff_up_pct, eff_dn_pct, progress_cb=update_progress)
 
         st.session_state.results = results
         st.session_state.last_scan_time = time.time()
