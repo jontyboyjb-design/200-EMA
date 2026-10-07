@@ -1,20 +1,21 @@
 """
-ChartFlow — EMA Box Screener (Bitget / Bybit / OKX edition)
-─────────────────────────────────────────────────────────
+ChartFlow — EMA Box Screener (Bitget edition)
+─────────────────────────────────────────────
 Run with:   streamlit run ema_box_screener_streamlit.py
 
-Logic  : Price is INSIDE the band  [ EMA × (1 - dn%) , EMA × (1 + up%) ]
-Columns: Exchange | TF | Symbol | Type | Price | EMA | % from EMA | Chart
-Movers : Spot movers per exchange + US Stock movers
+Logic   : Price is INSIDE the band  [ EMA × (1 - dn%) , EMA × (1 + up%) ]
+Markets : Bitget Spot | Bitget Futures (USDT-M perpetuals) | Bitget Tokenized Stocks
+          The three markets are mutually exclusive — a tokenized stock (e.g. rTSLA/USDT)
+          only ever appears under "Bitget Tokenized Stocks", never under "Bitget Spot".
+Columns : Market | TF | Symbol | Price | Chart
+Movers  : Top gainers / losers per market
 """
 
 import time
-import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ccxt
-import yfinance as yf
 import pandas as pd
 import streamlit as st
 
@@ -34,58 +35,52 @@ except Exception:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Exchange config — Bitget, Bybit, OKX
+#  Market config — Bitget Spot, Bitget Futures, Bitget Tokenized Stocks
 # ══════════════════════════════════════════════════════════════════════════════
+# "client" decides which ccxt client (spot or swap) supplies candles/tickers.
+# "kind"   decides how symbols are filtered.
+# "tv_suffix" is appended to the TradingView symbol (perpetuals use ".P").
 
 EXCHANGE_META = {
-    "bitget": {"label": "Bitget Spot", "tv_prefix": "BITGET", "ccxt_id": "bitget", "options": {}},
-    "bybit":  {"label": "Bybit Spot",  "tv_prefix": "BYBIT",  "ccxt_id": "bybit",  "options": {"defaultType": "spot"}},
-    "okx":    {"label": "OKX Spot",    "tv_prefix": "OKX",    "ccxt_id": "okx",    "options": {"defaultType": "spot"}},
+    "bitget_spot": {
+        "label": "Bitget Spot", "tv_prefix": "BITGET", "tv_suffix": "",
+        "client": "spot", "kind": "spot",
+    },
+    "bitget_futures": {
+        "label": "Bitget Futures", "tv_prefix": "BITGET", "tv_suffix": ".P",
+        "client": "swap", "kind": "futures",
+    },
+    "bitget_stocks": {
+        "label": "Bitget Tokenized Stocks", "tv_prefix": "BITGET", "tv_suffix": "",
+        "client": "spot", "kind": "stocks",
+    },
 }
-EXCHANGE_ORDER = ["bitget", "bybit", "okx"]
+EXCHANGE_ORDER = ["bitget_spot", "bitget_futures", "bitget_stocks"]
+
+CLIENT_OPTIONS = {
+    "spot": {"defaultType": "spot"},
+    "swap": {"defaultType": "swap", "defaultSubType": "linear"},
+}
 
 
 @st.cache_resource(show_spinner=False)
-def get_exchange_client(exchange_id: str):
-    meta = EXCHANGE_META[exchange_id]
-    klass = getattr(ccxt, meta["ccxt_id"])
-    params = {"enableRateLimit": True, "timeout": 20000}
-    if meta["options"]:
-        params["options"] = meta["options"]
-    return klass(params)
+def get_client(client_type: str):
+    """One ccxt Bitget client per product type ('spot' or 'swap')."""
+    return ccxt.bitget({
+        "enableRateLimit": True,
+        "timeout": 20000,
+        "options": CLIENT_OPTIONS[client_type],
+    })
 
 
-# ── Timeframe lists ────────────────────────────────────────────────────────────
+def get_market_client(market_id: str):
+    return get_client(EXCHANGE_META[market_id]["client"])
+
+
+# ── Timeframes ─────────────────────────────────────────────────────────────────
 CRYPTO_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "3d", "1w"]
-STOCK_TIMEFRAMES = ["1m", "5m", "15m", "1h", "1d", "1wk", "1mo"]
-
-YF_INTERVAL_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "1d": "1d", "1wk": "1wk", "1mo": "1mo"}
-YF_PERIOD_MAP = {"1m": "7d", "5m": "60d", "15m": "60d", "1h": "730d", "1d": "5y", "1wk": "5y", "1mo": "10y"}
 
 AUTO_SCAN_SECONDS = 3 * 60   # 3 minutes
-
-# ── US Stock universe — AUTO-POPULATED (no manual ticker list) ────────────────
-_FALLBACK_STOCKS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "BRK-B", "LLY", "AVGO",
-    "JPM", "TSLA", "UNH", "V", "XOM", "MA", "COST", "HD", "PG", "WMT",
-]
-
-
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def get_us_stock_universe(limit=100):
-    try:
-        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
-        df = pd.read_csv(url)
-        tickers = (
-            df["Symbol"].astype(str).str.strip()
-            .str.replace(".", "-", regex=False)   # BRK.B -> BRK-B (Yahoo Finance format)
-            .tolist()
-        )
-        if tickers:
-            return tickers[:limit]
-    except Exception:
-        pass
-    return _FALLBACK_STOCKS[:limit]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -96,7 +91,7 @@ def calc_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 
-def fetch_candles_crypto(client, symbol, timeframe, limit=300, retries=3):
+def fetch_candles(client, symbol, timeframe, limit=300, retries=3):
     for attempt in range(retries):
         try:
             raw = client.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -112,27 +107,6 @@ def fetch_candles_crypto(client, symbol, timeframe, limit=300, retries=3):
                 time.sleep(0.5 * (attempt + 1))
             else:
                 return None
-
-
-def fetch_candles_stock(symbol, timeframe):
-    try:
-        interval = YF_INTERVAL_MAP.get(timeframe)
-        period = YF_PERIOD_MAP.get(timeframe)
-        if not interval or not period:
-            return None
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval)
-        if df is None or len(df) < 50:
-            return None
-        df = df.reset_index()
-        df.columns = [c.lower() for c in df.columns]
-        df = df.rename(columns={"date": "timestamp", "datetime": "timestamp"})
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        if df["timestamp"].dt.tz is not None:
-            df["timestamp"] = df["timestamp"].dt.tz_localize(None)
-        return df[["timestamp", "open", "high", "low", "close", "volume"]].tail(300).reset_index(drop=True)
-    except Exception:
-        return None
 
 
 # ── Market helpers ─────────────────────────────────────────────────────────────
@@ -161,36 +135,47 @@ def is_stablecoin_pair(symbol):
     return base in STABLECOIN_BASES
 
 
-# ── Tokenized-stock exclusion (Bitget "Stocks 2.0" RWA program only) ─────────
-# Bitget lists hundreds of tokenized stocks/ETFs (e.g. RCOST/USDT) as ordinary
-# USDT spot pairs, all systematically prefixed with "R". This heuristic is
-# Bitget-specific — Bybit/OKX don't run this program, so it's skipped there.
+# ── Tokenized-stock detection (Bitget "Stocks 2.0" rTokens) ──────────────────
+# Bitget lists tokenized stocks / ETFs as ordinary USDT spot pairs using an
+# "r + ticker" convention (rTSLA/USDT, rNVDA/USDT, rSPY/USDT, ...).
+# Because a handful of real crypto coins also start with "R" (RUNE, RAY, ROSE...),
+# those are whitelisted below so they stay in Bitget Spot.
 PROTECTED_R_CRYPTO_TICKERS = {
     "RNDR", "RENDER", "RUNE", "RVN", "RAY", "ROSE", "RSR", "REN", "RLC", "RACA",
     "RDNT", "RPL", "REQ", "RIF", "RBN", "RSS3", "RARE", "RGT", "REZ", "RAD", "RON",
     "RFOX", "RAMP", "RACE", "REI", "RIO", "RBTC", "RDAO", "RAIL", "RIDE", "RFUEL",
     "RAIN", "RDPX", "RWA", "RBX", "RING", "RIZON", "ROOT", "ROUTE", "REVV", "RFR",
-    "RIN", "RZR", "RAID", "RDC", "RBC", "RSC", "RGB", "RPLS",
+    "RIN", "RZR", "RAID", "RDC", "RBC", "RSC", "RGB", "RPLS", "REEF", "RARI", "RLY",
+    "REP", "RONIN", "RPK", "RETH", "RSETH", "RAVE", "RECALL", "RED", "RESOLV", "REX",
+    "RBNT", "RCADE", "RIFSOL", "ROAM", "ROCK", "RYO",
 }
 
 
-def is_tokenized_stock_pair(symbol, exchange_id, market=None):
-    if exchange_id != "bitget":
-        return False
+def is_tokenized_stock_pair(symbol, market=None):
+    """True for Bitget spot tokenized stocks / ETFs (rTSLA, rNVDA, rSPY, ...)."""
+    base = symbol.split("/")[0]
+    base_up = base.upper()
 
-    base = symbol.split("/")[0].upper()
-    if base in PROTECTED_R_CRYPTO_TICKERS:
-        return False
-
+    # Explicit RWA flag from the exchange metadata, if present.
     if market:
         info = market.get("info", {}) or {}
         for key, val in info.items():
-            if "RWA" in str(key).upper():
-                if str(val).upper() in ("YES", "TRUE", "1", "Y"):
-                    return True
+            if "RWA" in str(key).upper() and str(val).upper() in ("YES", "TRUE", "1", "Y"):
+                return True
 
-    if len(base) >= 2 and base[0] == "R" and base[1:].isalpha():
+    # Strong signal: lowercase "r" prefix + uppercase ticker (e.g. "rTSLA").
+    if len(base) >= 2 and base[0] == "r" and base[1:].replace("-", "").replace(".", "").isalnum() \
+            and base[1:].upper() == base[1:]:
         return True
+
+    if base_up in PROTECTED_R_CRYPTO_TICKERS:
+        return False
+
+    # Fallback heuristic: R + letters (also allow "." / "-" for tickers like BRK-B).
+    if len(base_up) >= 2 and base_up[0] == "R":
+        rest = base_up[1:]
+        if rest.replace("-", "").replace(".", "").isalpha():
+            return True
 
     return False
 
@@ -244,49 +229,75 @@ def get_ticker_percentage(ticker):
 
 
 @st.cache_data(ttl=90, show_spinner=False)
-def fetch_markets_and_tickers(exchange_id):
-    """Cached (90s) markets + tickers snapshot for one exchange."""
-    client = get_exchange_client(exchange_id)
+def fetch_markets_and_tickers(client_type):
+    """Cached (90s) markets + tickers snapshot for the spot or swap client."""
+    client = get_client(client_type)
     markets = client.load_markets()
     tickers = client.fetch_tickers()
     return markets, tickers
 
 
-def get_all_pairs(exchange_id):
+def symbol_belongs_to_market(market_id, symbol, market):
+    """Single source of truth — decides which of the 3 markets a symbol lives in."""
+    kind = EXCHANGE_META[market_id]["kind"]
+    if not market:
+        return False
+
+    if kind == "futures":
+        return bool(
+            market.get("swap")
+            and market.get("linear")
+            and market.get("quote") == "USDT"
+            and not is_stablecoin_pair(symbol)
+        )
+
+    # spot + tokenized stocks both come from USDT spot pairs
+    if not market.get("spot") or not symbol.endswith("/USDT"):
+        return False
+
+    is_stock = is_tokenized_stock_pair(symbol, market)
+    if kind == "stocks":
+        return is_stock
+    # kind == "spot": real crypto only
+    return (not is_stock) and (not is_stablecoin_pair(symbol))
+
+
+def list_market_symbols(market_id):
+    """All live symbols for a market with their tickers: list of (symbol, ticker)."""
+    client_type = EXCHANGE_META[market_id]["client"]
+    markets, tickers = fetch_markets_and_tickers(client_type)
+    out = []
+    for symbol, ticker in tickers.items():
+        market = markets.get(symbol)
+        if symbol_belongs_to_market(market_id, symbol, market) and is_market_live(market, ticker):
+            out.append((symbol, ticker))
+    return out
+
+
+def get_all_pairs(market_id):
     try:
-        markets, tickers = fetch_markets_and_tickers(exchange_id)
-        return sorted([
-            s for s in markets
-            if s.endswith("/USDT")
-            and not is_stablecoin_pair(s)
-            and not is_tokenized_stock_pair(s, exchange_id, markets[s])
-            and is_market_live(markets[s], tickers.get(s))
-        ])
+        return sorted(s for s, _ in list_market_symbols(market_id))
     except Exception:
         return []
 
 
-def get_top_pairs(exchange_id, limit=200):
+def get_top_pairs(market_id, limit=200):
     try:
-        markets, tickers = fetch_markets_and_tickers(exchange_id)
-        pairs = [
-            s for s in markets
-            if s.endswith("/USDT")
-            and not is_stablecoin_pair(s)
-            and not is_tokenized_stock_pair(s, exchange_id, markets[s])
-            and is_market_live(markets[s], tickers.get(s))
-        ]
-        pairs.sort(key=lambda s: get_quote_volume(tickers.get(s, {})), reverse=True)
-        return pairs[:limit]
+        rows = list_market_symbols(market_id)
+        rows.sort(key=lambda r: get_quote_volume(r[1]), reverse=True)
+        return [s for s, _ in rows[:limit]]
     except Exception:
-        return get_all_pairs(exchange_id)[:limit]
+        return get_all_pairs(market_id)[:limit]
+
+
+def tradingview_symbol(market_id, symbol):
+    meta = EXCHANGE_META[market_id]
+    base_quote = symbol.split(":")[0].replace("/", "")   # BTC/USDT:USDT -> BTCUSDT
+    return f"{meta['tv_prefix']}:{base_quote}{meta['tv_suffix']}"
 
 
 def tradingview_url(result):
-    if result.get("AssetType") == "stock":
-        return f"https://www.tradingview.com/chart/?symbol={result['Symbol']}"
-    tv_prefix = EXCHANGE_META[result["Exchange ID"]]["tv_prefix"]
-    return f"https://www.tradingview.com/chart/?symbol={tv_prefix}:{result['Symbol'].replace('/', '')}"
+    return f"https://www.tradingview.com/chart/?symbol={tradingview_symbol(result['Exchange ID'], result['Symbol'])}"
 
 
 def fmt_price(price):
@@ -302,17 +313,12 @@ def fmt_price(price):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def analyze_ema_box(job, ema_period, up_pct, dn_pct):
-    """job = (symbol, timeframe, asset_type, exchange_id)"""
-    symbol, timeframe, asset_type, exchange_id = job
+    """job = (symbol, timeframe, market_id)"""
+    symbol, timeframe, market_id = job
     try:
-        if asset_type == "crypto":
-            client = get_exchange_client(exchange_id)
-            df = fetch_candles_crypto(client, symbol, timeframe)
-            exchange_label = EXCHANGE_META[exchange_id]["label"]
-        else:
-            df = fetch_candles_stock(symbol, timeframe)
-            exchange_label = "US Stock"
-            exchange_id = "us_stock"
+        client = get_market_client(market_id)
+        df = fetch_candles(client, symbol, timeframe)
+        market_label = EXCHANGE_META[market_id]["label"]
 
         if df is None or len(df) < max(ema_period, 20):
             return None
@@ -339,11 +345,11 @@ def analyze_ema_box(job, ema_period, up_pct, dn_pct):
         pct_from_ema = (last_close - last_ema) / last_ema * 100
 
         return {
-            "Exchange": exchange_label,
-            "Exchange ID": exchange_id,
+            "Exchange": market_label,
+            "Exchange ID": market_id,
             "Timeframe": timeframe,
             "Symbol": symbol,
-            "AssetType": asset_type,
+            "AssetType": "crypto",
             "Price": last_close,
             "EMA": last_ema,
             "UpperBand": upper_band,
@@ -400,56 +406,13 @@ def run_ema_box_scan(jobs, ema_period, up_pct, dn_pct, progress_cb=None):
 #  Movers helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_exchange_mover_rows(exchange_id, limit=20):
-    markets, tickers = fetch_markets_and_tickers(exchange_id)
-
+def get_market_mover_rows(market_id, limit=20):
     rows = []
-    for symbol, ticker in tickers.items():
-        if not symbol.endswith("/USDT"):
-            continue
-        if is_stablecoin_pair(symbol):
-            continue
-        market = markets.get(symbol)
-        if not market or is_tokenized_stock_pair(symbol, exchange_id, market):
-            continue
-        if not is_market_live(market, ticker):
-            continue
+    for symbol, ticker in list_market_symbols(market_id):
         pct = get_ticker_percentage(ticker)
         if pct is not None:
             rows.append({"symbol": symbol, "pct": pct})
 
-    gainers = sorted(rows, key=lambda x: x["pct"], reverse=True)[:limit]
-    losers = sorted(rows, key=lambda x: x["pct"])[:limit]
-    for idx, r in enumerate(gainers, 1):
-        r["rank"] = idx
-    for idx, r in enumerate(losers, 1):
-        r["rank"] = idx
-    return gainers, losers
-
-
-@st.cache_data(ttl=90, show_spinner=False)
-def get_us_stock_mover_rows(limit=20):
-    rows = []
-    stock_list = get_us_stock_universe(100)
-    try:
-        raw = yf.download(
-            " ".join(stock_list),
-            period="2d", interval="1d",
-            progress=False, group_by="ticker", auto_adjust=True,
-        )
-        for sym in stock_list:
-            try:
-                if isinstance(raw.columns, pd.MultiIndex):
-                    closes = raw[sym]["Close"].dropna()
-                else:
-                    closes = raw["Close"].dropna()
-                if len(closes) >= 2:
-                    pct = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2] * 100
-                    rows.append({"symbol": sym, "pct": round(float(pct), 2)})
-            except Exception:
-                pass
-    except Exception:
-        pass
     gainers = sorted(rows, key=lambda x: x["pct"], reverse=True)[:limit]
     losers = sorted(rows, key=lambda x: x["pct"])[:limit]
     for idx, r in enumerate(gainers, 1):
@@ -465,36 +428,30 @@ def get_us_stock_mover_rows(limit=20):
 
 def results_to_dataframe(results):
     if not results:
-        return pd.DataFrame(columns=["Exchange", "TF", "Symbol", "Type", "Price", "Chart"])
+        return pd.DataFrame(columns=["Market", "TF", "Symbol", "Price", "Chart"])
 
     rows = []
     for r in results:
         rows.append({
-            "Exchange": r["Exchange"],
+            "Market": r["Exchange"],
             "TF": r["Timeframe"],
             "Symbol": r["Symbol"],
-            "Type": "Stock" if r.get("AssetType") == "stock" else "Crypto",
             "Price": fmt_price(r["Price"]),
             "Chart": tradingview_url(r),
         })
     return pd.DataFrame(rows)
 
 
-def movers_to_dataframe(rows, tv_prefix=None, is_stock=False):
+def movers_to_dataframe(rows, market_id):
     if not rows:
         return pd.DataFrame(columns=["Rank", "Ticker", "%", "Chart"])
-
-    def make_href(sym):
-        if is_stock:
-            return f"https://www.tradingview.com/chart/?symbol={sym}"
-        return f"https://www.tradingview.com/chart/?symbol={tv_prefix}:{sym.replace('/', '')}"
 
     return pd.DataFrame([
         {
             "Rank": r["rank"],
             "Ticker": r["symbol"],
             "%": f"{r['pct']:+.2f}%",
-            "Chart": make_href(r["symbol"]),
+            "Chart": f"https://www.tradingview.com/chart/?symbol={tradingview_symbol(market_id, r['symbol'])}",
         }
         for r in rows
     ])
@@ -523,9 +480,9 @@ with st.sidebar:
     st.title("▦ ChartFlow")
     st.caption("EMA Box Screener")
 
-    st.subheader("Exchanges")
-    selected_exchanges = st.multiselect(
-        "Crypto exchanges",
+    st.subheader("Markets")
+    selected_markets = st.multiselect(
+        "Bitget markets",
         options=EXCHANGE_ORDER,
         default=EXCHANGE_ORDER,
         format_func=lambda x: EXCHANGE_META[x]["label"],
@@ -536,18 +493,8 @@ with st.sidebar:
         format_func=lambda x: "Top 200 by volume" if x == "top200" else "All pairs",
         horizontal=True,
     )
-    include_stocks = st.checkbox("Include Top 100 US Stocks", value=False)
 
-    if selected_exchanges:
-        crypto_tf = st.selectbox("Crypto timeframe", CRYPTO_TIMEFRAMES, index=CRYPTO_TIMEFRAMES.index("1d"))
-    else:
-        crypto_tf = "1d"
-
-    if include_stocks:
-        stock_tf = st.selectbox("Stock timeframe", STOCK_TIMEFRAMES, index=STOCK_TIMEFRAMES.index("1d"))
-        st.caption("1m = last 7d · 5m/15m = last 60d")
-    else:
-        stock_tf = "1d"
+    timeframe = st.selectbox("Timeframe", CRYPTO_TIMEFRAMES, index=CRYPTO_TIMEFRAMES.index("1d"))
 
     st.subheader("EMA Settings")
     ema_period = st.number_input("EMA Period", min_value=1, value=200, step=1)
@@ -576,23 +523,20 @@ if HAS_AUTOREFRESH and auto_scan:
 
 # ── Main content ─────────────────────────────────────────────────────────────
 st.title("EMA Box Screener")
-st.caption("Bitget · Bybit · OKX · US Stocks")
+st.caption("Bitget Spot · Bitget Futures · Bitget Tokenized Stocks")
 
 should_scan = scan_clicked or due_for_autoscan
 
 if should_scan:
-    if not selected_exchanges and not include_stocks:
-        st.warning("Select at least one exchange or include US stocks before scanning.")
+    if not selected_markets:
+        st.warning("Select at least one market before scanning.")
     else:
         jobs = []
         with st.spinner("Building ticker universe..."):
-            for ex_id in selected_exchanges:
-                pairs = get_all_pairs(ex_id) if universe_scope == "all" else get_top_pairs(ex_id, 200)
+            for mkt_id in selected_markets:
+                pairs = get_all_pairs(mkt_id) if universe_scope == "all" else get_top_pairs(mkt_id, 200)
                 for pair in pairs:
-                    jobs.append((pair, crypto_tf, "crypto", ex_id))
-            if include_stocks:
-                for sym in get_us_stock_universe(100):
-                    jobs.append((sym, stock_tf, "stock", None))
+                    jobs.append((pair, timeframe, mkt_id))
 
         progress_label = st.empty()
         progress_bar = st.progress(0)
@@ -627,28 +571,37 @@ with col2:
         remaining = max(0, AUTO_SCAN_SECONDS - (time.time() - st.session_state.last_scan_time))
         st.caption(f"next auto-scan in {int(remaining)}s")
 
-results_df = results_to_dataframe(results)
-st.dataframe(
-    results_df,
-    use_container_width=True,
-    hide_index=True,
-    height=full_height(results_df),
-    column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="Open")},
-)
+# Results are shown in separate tables per market so spot and tokenized
+# stocks can never be mixed together.
+if not results:
+    empty_df = results_to_dataframe([])
+    st.dataframe(empty_df, use_container_width=True, hide_index=True, height=full_height(empty_df))
+else:
+    for mkt_id in EXCHANGE_ORDER:
+        mkt_results = [r for r in results if r["Exchange ID"] == mkt_id]
+        if not mkt_results:
+            continue
+        st.subheader(f"{EXCHANGE_META[mkt_id]['label']} ({len(mkt_results)})")
+        mkt_df = results_to_dataframe(mkt_results)
+        st.dataframe(
+            mkt_df,
+            use_container_width=True,
+            hide_index=True,
+            height=full_height(mkt_df),
+            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="Open")},
+        )
 
 # ── Movers section ───────────────────────────────────────────────────────────
 st.header("Market Movers")
 
-mover_tabs_labels = [EXCHANGE_META[e]["label"] for e in EXCHANGE_ORDER] + ["US Stocks"]
-tabs = st.tabs(mover_tabs_labels)
+tabs = st.tabs([EXCHANGE_META[m]["label"] for m in EXCHANGE_ORDER])
 
-for i, ex_id in enumerate(EXCHANGE_ORDER):
+for i, mkt_id in enumerate(EXCHANGE_ORDER):
     with tabs[i]:
         try:
-            gainers, losers = get_exchange_mover_rows(ex_id)
-            tv_prefix = EXCHANGE_META[ex_id]["tv_prefix"]
-            gainers_df = movers_to_dataframe(gainers, tv_prefix=tv_prefix)
-            losers_df = movers_to_dataframe(losers, tv_prefix=tv_prefix)
+            gainers, losers = get_market_mover_rows(mkt_id)
+            gainers_df = movers_to_dataframe(gainers, mkt_id)
+            losers_df = movers_to_dataframe(losers, mkt_id)
             c1, c2 = st.columns(2)
             with c1:
                 st.subheader("Top Gainers")
@@ -667,29 +620,4 @@ for i, ex_id in enumerate(EXCHANGE_ORDER):
                     column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="Open")},
                 )
         except Exception as e:
-            st.error(f"{EXCHANGE_META[ex_id]['label']} movers error: {e}")
-
-with tabs[-1]:
-    try:
-        us_gainers, us_losers = get_us_stock_mover_rows()
-        us_gainers_df = movers_to_dataframe(us_gainers, is_stock=True)
-        us_losers_df = movers_to_dataframe(us_losers, is_stock=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Top Gainers")
-            st.dataframe(
-                us_gainers_df,
-                use_container_width=True, hide_index=True,
-                height=full_height(us_gainers_df),
-                column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="Open")},
-            )
-        with c2:
-            st.subheader("Top Losers")
-            st.dataframe(
-                us_losers_df,
-                use_container_width=True, hide_index=True,
-                height=full_height(us_losers_df),
-                column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="Open")},
-            )
-    except Exception as e:
-        st.error(f"US Stock movers error: {e}")
+            st.error(f"{EXCHANGE_META[mkt_id]['label']} movers error: {e}")
