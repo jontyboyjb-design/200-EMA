@@ -290,8 +290,64 @@ def get_top_pairs(market_id, limit=200):
         return get_all_pairs(market_id)[:limit]
 
 
+# Tokenized stocks (rTSLA, rCRCL, ...) don't exist on TradingView as Bitget pairs,
+# so the chart link points at the real underlying stock instead.
+# The exchange is looked up dynamically from NASDAQ Trader's official daily
+# symbol directories (no hard-coded ticker list). If the lookup fails, the link
+# falls back to the bare ticker and TradingView picks the primary listing.
+NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+
+# otherlisted.txt "Exchange" column -> TradingView exchange prefix
+OTHER_EXCHANGE_TO_TV = {"N": "NYSE", "A": "AMEX", "P": "AMEX", "Z": "BATS"}
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def load_stock_exchange_map():
+    """{TICKER: TradingView exchange prefix} for every US-listed stock/ETF."""
+    import requests
+
+    mapping = {}
+    try:
+        r = requests.get(NASDAQ_LISTED_URL, timeout=15)
+        r.raise_for_status()
+        for line in r.text.splitlines()[1:]:
+            parts = line.split("|")
+            if len(parts) > 1 and parts[0] and not parts[0].startswith("File Creation"):
+                mapping[parts[0].strip().upper()] = "NASDAQ"
+    except Exception:
+        pass
+    try:
+        r = requests.get(OTHER_LISTED_URL, timeout=15)
+        r.raise_for_status()
+        for line in r.text.splitlines()[1:]:
+            parts = line.split("|")
+            if len(parts) > 2 and parts[0] and not parts[0].startswith("File Creation"):
+                exch = OTHER_EXCHANGE_TO_TV.get(parts[2].strip())
+                if exch:
+                    mapping.setdefault(parts[0].strip().upper(), exch)
+    except Exception:
+        pass
+    return mapping
+
+
+def underlying_stock_ticker(symbol):
+    """rTSLA/USDT -> TSLA"""
+    base = symbol.split("/")[0]
+    return base[1:] if base[:1] in ("r", "R") else base
+
+
 def tradingview_symbol(market_id, symbol):
     meta = EXCHANGE_META[market_id]
+
+    if meta["kind"] == "stocks":
+        ticker = underlying_stock_ticker(symbol).upper()
+        exch_map = load_stock_exchange_map()
+        # NASDAQ's directory writes class shares as BRK.B; Bitget may use BRK-B
+        exch = exch_map.get(ticker) or exch_map.get(ticker.replace("-", "."))
+        ticker = ticker.replace("-", ".")
+        return f"{exch}:{ticker}" if exch else ticker
+
     base_quote = symbol.split(":")[0].replace("/", "")   # BTC/USDT:USDT -> BTCUSDT
     return f"{meta['tv_prefix']}:{base_quote}{meta['tv_suffix']}"
 
